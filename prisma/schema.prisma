@@ -1,0 +1,339 @@
+const express = require('express')
+const cors = require('cors')
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+const { PrismaClient } = require('@prisma/client')
+
+const app = express()
+const prisma = new PrismaClient()
+const PORT = process.env.PORT || 3001
+const JWT_SECRET = process.env.JWT_SECRET || 'replit-indonesia-dev-secret'
+
+app.use(cors())
+app.use(express.json({ limit: '2mb' }))
+
+function signToken(user) {
+  return jwt.sign(
+    { id: user.id, email: user.email, name: user.name },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  )
+}
+
+async function authenticate(req, res, next) {
+  const authHeader = req.headers.authorization || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+
+  if (!token) {
+    return res.status(401).json({ message: 'Token tidak ditemukan.' })
+  }
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET)
+    req.user = payload
+    return next()
+  } catch (error) {
+    return res.status(401).json({ message: 'Token tidak valid.' })
+  }
+}
+
+function createStarterFiles(language) {
+  const templates = {
+    React: [
+      {
+        path: 'src/App.jsx',
+        content: `import React from 'react'
+
+export default function App() {
+  return (
+    <main className="page-shell">
+      <h1>Halo dari Replit Indonesia</h1>
+      <p>Project React Anda siap dikembangkan.</p>
+    </main>
+  )
+}
+`
+      }
+    ],
+    'Node.js': [
+      {
+        path: 'server.js',
+        content: `const express = require('express')
+const app = express()
+
+app.get('/', (req, res) => {
+  res.json({ message: 'Halo dari API Replit Indonesia' })
+})
+
+app.listen(3000, () => {
+  console.log('Server berjalan di http://localhost:3000')
+})
+`
+      }
+    ],
+    Python: [
+      {
+        path: 'main.py',
+        content: `print('Halo dari Replit Indonesia')
+print('Project Python Anda siap dibuat.')
+`
+      }
+    ]
+  }
+
+  return templates[language] || templates.React
+}
+
+app.get('/api/health', (_, res) => {
+  res.json({ ok: true, message: 'Replit Indonesia API siap.' })
+})
+
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body || {}
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Nama, email, dan password wajib diisi.' })
+  }
+
+  try {
+    const existing = await prisma.user.findUnique({ where: { email: String(email).toLowerCase() } })
+    if (existing) {
+      return res.status(409).json({ message: 'Email sudah terdaftar.' })
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10)
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email: String(email).toLowerCase(),
+        password: hashedPassword
+      }
+    })
+
+    const token = signToken(user)
+    return res.status(201).json({
+      token,
+      user: { id: user.id, name: user.name, email: user.email }
+    })
+  } catch (error) {
+    console.error('Register error:', error)
+    return res.status(500).json({ message: 'Registrasi gagal.' })
+  }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {}
+
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email dan password wajib diisi.' })
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email: String(email).toLowerCase() }
+    })
+
+    if (!user) {
+      return res.status(401).json({ message: 'Email tidak ditemukan.' })
+    }
+
+    const valid = await bcrypt.compare(password, user.password)
+    if (!valid) {
+      return res.status(401).json({ message: 'Password salah.' })
+    }
+
+    const token = signToken(user)
+    return res.json({
+      token,
+      user: { id: user.id, name: user.name, email: user.email }
+    })
+  } catch (error) {
+    console.error('Login error:', error)
+    return res.status(500).json({ message: 'Login gagal.' })
+  }
+})
+
+app.get('/api/auth/me', authenticate, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } })
+    if (!user) {
+      return res.status(404).json({ message: 'User tidak ditemukan.' })
+    }
+
+    return res.json({ user: { id: user.id, name: user.name, email: user.email } })
+  } catch (error) {
+    console.error('Me error:', error)
+    return res.status(500).json({ message: 'Tidak dapat mengambil data user.' })
+  }
+})
+
+app.get('/api/projects', authenticate, async (req, res) => {
+  try {
+    const projects = await prisma.project.findMany({
+      where: { userId: req.user.id },
+      include: { files: true },
+      orderBy: { updatedAt: 'desc' }
+    })
+
+    return res.json({ projects })
+  } catch (error) {
+    console.error('List project error:', error)
+    return res.status(500).json({ message: 'Gagal mengambil proyek.' })
+  }
+})
+
+app.post('/api/projects', authenticate, async (req, res) => {
+  const { name, language, description } = req.body || {}
+
+  if (!name || !language) {
+    return res.status(400).json({ message: 'Nama project dan bahasa pemrograman wajib diisi.' })
+  }
+
+  try {
+    const project = await prisma.project.create({
+      data: {
+        name,
+        language,
+        description: description || `Project ${name} dibuat dengan ${language}`,
+        userId: req.user.id,
+        files: {
+          create: createStarterFiles(language)
+        }
+      },
+      include: { files: true }
+    })
+
+    return res.status(201).json({ project })
+  } catch (error) {
+    console.error('Create project error:', error)
+    return res.status(500).json({ message: 'Gagal membuat project.' })
+  }
+})
+
+app.put('/api/projects/:id/files', authenticate, async (req, res) => {
+  const { path, content } = req.body || {}
+  const { id } = req.params
+
+  if (!path || typeof content !== 'string') {
+    return res.status(400).json({ message: 'Path dan konten file wajib diisi.' })
+  }
+
+  try {
+    const project = await prisma.project.findFirst({
+      where: { id, userId: req.user.id },
+      include: { files: true }
+    })
+
+    if (!project) {
+      return res.status(404).json({ message: 'Project tidak ditemukan.' })
+    }
+
+    const existingFile = project.files.find((file) => file.path === path)
+
+    const file = existingFile
+      ? await prisma.projectFile.update({
+          where: { id: existingFile.id },
+          data: { content }
+        })
+      : await prisma.projectFile.create({
+          data: {
+            projectId: project.id,
+            path,
+            content
+          }
+        })
+
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { updatedAt: new Date() }
+    })
+
+    return res.json({ ok: true, file })
+  } catch (error) {
+    console.error('Save file error:', error)
+    return res.status(500).json({ message: 'Gagal menyimpan file.' })
+  }
+})
+
+app.post('/api/projects/:id/run', authenticate, async (req, res) => {
+  const { path, content } = req.body || {}
+  const { id } = req.params
+
+  try {
+    const project = await prisma.project.findFirst({
+      where: { id, userId: req.user.id },
+      include: { files: true }
+    })
+
+    if (!project) {
+      return res.status(404).json({ message: 'Project tidak ditemukan.' })
+    }
+
+    if (path && content !== undefined) {
+      const file = project.files.find((item) => item.path === path)
+      if (file) {
+        await prisma.projectFile.update({
+          where: { id: file.id },
+          data: { content }
+        })
+      }
+    }
+
+    const firstFile = project.files[0]
+    const output = `Running ${project.name} (${project.language})\n` +
+      `File: ${firstFile?.path || 'main'}\n` +
+      `Status: ready\n` +
+      `Preview: ${String(firstFile?.content || '').slice(0, 120)}`
+
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { lastRunOutput: output, updatedAt: new Date() }
+    })
+
+    return res.json({ ok: true, output })
+  } catch (error) {
+    console.error('Run project error:', error)
+    return res.status(500).json({ message: 'Gagal menjalankan project.' })
+  }
+})
+
+app.post('/api/projects/:id/deploy', authenticate, async (req, res) => {
+  const { id } = req.params
+
+  try {
+    const project = await prisma.project.findFirst({
+      where: { id, userId: req.user.id }
+    })
+
+    if (!project) {
+      return res.status(404).json({ message: 'Project tidak ditemukan.' })
+    }
+
+    const deployment = {
+      id: `deploy_${Date.now()}`,
+      projectId: project.id,
+      status: 'success',
+      url: `https://${project.name.toLowerCase().replace(/\s+/g, '-')}.replit-indo.dev`,
+      deployedAt: new Date().toISOString()
+    }
+
+    return res.json({ ok: true, deployment })
+  } catch (error) {
+    console.error('Deploy error:', error)
+    return res.status(500).json({ message: 'Deploy gagal.' })
+  }
+})
+
+async function startServer() {
+  try {
+    await prisma.$connect()
+    app.listen(PORT, () => {
+      console.log(`Replit Indonesia API berjalan di http://localhost:${PORT}`)
+    })
+  } catch (error) {
+    console.error('Database connection failed:', error)
+    process.exit(1)
+  }
+}
+
+startServer()
